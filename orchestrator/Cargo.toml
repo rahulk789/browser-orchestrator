@@ -7,7 +7,7 @@ edition = "2024"
 utoipa-scalar = { version = "0.3.0", features = ["axum"] }
 anyhow = "1.0.100"
 axum = "0.8.8"
-reqwest = "0.13.1"
+reqwest = { version = "0.13.1", features = ["json"] }
 restate-sdk = { version="0.7.0", features = ["schemars"] }
 schemars = "1.2.0"
 serde = {version = "1.0.228", features = ["derive"]}

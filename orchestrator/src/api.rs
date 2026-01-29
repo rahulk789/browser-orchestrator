@@ -1,4 +1,5 @@
-use axum::Router;
+use axum::Json;
+use axum::{Router, response::IntoResponse};
 use axum::{extract::Path, extract::State, http::StatusCode};
 use reqwest::Client;
 use restate_sdk::prelude::*;
@@ -7,7 +8,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::net::TcpListener;
 use tokio::process::Command;
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use utoipa_scalar::Scalar;
 use utoipa_scalar::Servable;
@@ -16,7 +17,7 @@ use utoipa_scalar::Servable;
 #[openapi(paths(health, status, get_session, post_session, delete_session))]
 pub struct ApiDoc;
 
-#[derive(Clone)]
+#[derive(Default, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct AppState {
     pub restate_base_url: String,
 }
@@ -36,8 +37,10 @@ pub struct Session {
     id: String,
     available: bool,
     worker_id: String,
+    user: String,
+    // data: Data,
+    // created_at: i64,
 }
-
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct Worker {
     id: String,
@@ -49,10 +52,20 @@ pub struct Pool {
     session_list: Vec<Session>,
     worker_list: Vec<Worker>,
 }
+#[derive(Deserialize)]
+struct CreateSessionResponse {
+    id: String,
+    created_at: i64,
+    data: Data,
+}
+#[derive(Default, Clone, Deserialize, Serialize, JsonSchema, ToSchema)]
+pub struct Data {
+    pub user: String,
+}
 // Restate service definition
 #[restate_sdk::object]
 pub trait WorkerPoolService {
-    async fn spawn_worker() -> Result<String, HandlerError>;
+    async fn spawn_worker(user: String) -> Result<String, HandlerError>;
     async fn health_check(session_id: String) -> Result<String, HandlerError>;
     async fn status_check(session_id: String) -> Result<String, HandlerError>;
     // async fn health_poll(session_id: String) -> Result<(), HandlerError>;
@@ -164,7 +177,11 @@ impl WorkerPoolService for Pool {
 
         Ok(health_status)
     }
-    async fn spawn_worker(&self, mut ctx: ObjectContext<'_>) -> Result<String, HandlerError> {
+    async fn spawn_worker(
+        &self,
+        mut ctx: ObjectContext<'_>,
+        user: String,
+    ) -> Result<String, HandlerError> {
         let ready_port = get_port();
         ctx.run(|| async {
             Command::new("steel-browser")
@@ -177,54 +194,58 @@ impl WorkerPoolService for Pool {
         })
         .await?;
 
+        // Give it a moment to start
+        ctx.sleep(std::time::Duration::from_millis(500)).await?;
         let worker_id = ctx.rand_uuid().to_string();
+
         let worker = Worker {
             id: worker_id.clone(),
             port: ready_port,
             available: true,
         };
-        let session = Session {
-            id: ctx.rand_uuid().to_string(),
-            available: true,
-            worker_id: worker_id,
-        };
+
         let mut pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => Pool::default(),
         };
-
-        // Update state
+        // Update worker
         pool.worker_list.insert(0, worker.clone());
-        pool.session_list.insert(0, session.clone());
         let worker_port = worker
             .port
             .ok_or(TerminalError::new(format!("Error fetching worker port")))?;
-
-        let client = Client::new();
-        let health_status: String = ctx
+        let spawn_session: String = ctx
             .run(move || async move {
+                let client = Client::new();
+
                 let response = client
-                    .post(format!(
-                        "http://localhost:{}/sessions/{}",
-                        worker_port, session.id
-                    ))
+                    .post(format!("http://localhost:{}/sessions", worker_port))
+                    .json(&serde_json::json!({ "user": user }))
                     .send()
                     .await
-                    .map_err(|e| {
-                        TerminalError::new(format!("Failed to send health request: {}", e))
-                    })?;
+                    .map_err(|e| TerminalError::new(format!("Failed to create session: {}", e)))?;
 
                 let body = response.text().await.map_err(|e| {
-                    TerminalError::new(format!("Failed to read health response body: {}", e))
+                    TerminalError::new(format!("Failed to read response body: {}", e))
                 })?;
 
                 Ok(body)
             })
             .await?;
+        let parsed: CreateSessionResponse = serde_json::from_str(&spawn_session.clone())
+            .map_err(|e| TerminalError::new(format!("Invalid JSON response: {}", e)))?;
+
+        let session = Session {
+            id: parsed.id,
+            available: true,
+            worker_id: worker_id,
+            user: parsed.data.user,
+        };
+        // Update Session
+        pool.session_list.insert(0, session.clone());
         let bytes = serde_json::to_vec(&pool)?;
         // Persist state
         ctx.set("pool_state", bytes);
-        Ok(health_status)
+        Ok(spawn_session + "\nworker_port:" + &worker_port.to_string())
     }
     async fn get_session(
         &self,
@@ -354,7 +375,7 @@ async fn health(
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/health_check/{}",
+        "{}/WorkerPoolService/pool/health_check/{}",
         state.restate_base_url, id
     );
 
@@ -392,7 +413,7 @@ async fn status(
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/status_check/{}",
+        "{}/WorkerPoolService/pool/status_check/{}",
         state.restate_base_url, id
     );
 
@@ -421,14 +442,14 @@ async fn status(
         (status = 500, description = "Internal server error", body = String)
     )
 )]
-async fn get_session(
+pub async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<String, (StatusCode, String)> {
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/get_session/{}",
+        "{}/WorkerPoolService/pool/get_session/{}",
         state.restate_base_url, id
     );
 
@@ -446,6 +467,7 @@ async fn get_session(
         )
     })
 }
+
 #[utoipa::path(
     post,
     path = "/session",
@@ -454,17 +476,28 @@ async fn get_session(
         (status = 500, description = "Internal server error", body = String)
     )
 )]
-async fn post_session(State(state): State<AppState>) -> Result<String, (StatusCode, String)> {
+pub async fn post_session(
+    State(state): State<AppState>,
+    Json(payload): Json<Data>,
+) -> impl IntoResponse {
     let client = Client::new();
 
-    let url = format!("{}/WorkerPoolService/spawn_worker", state.restate_base_url);
+    let url = format!(
+        "{}/WorkerPoolService/pool/spawn_worker",
+        state.restate_base_url
+    );
 
-    let response = client.post(url).send().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to spawn session: {e}"),
-        )
-    })?;
+    let response = client
+        .post(url)
+        .json(&payload.user)
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to spawn session: {e}"),
+            )
+        })?;
 
     response.text().await.map_err(|e| {
         (
@@ -473,6 +506,7 @@ async fn post_session(State(state): State<AppState>) -> Result<String, (StatusCo
         )
     })
 }
+
 #[utoipa::path(
     delete,
     path = "/session/{id}",
@@ -484,14 +518,14 @@ async fn post_session(State(state): State<AppState>) -> Result<String, (StatusCo
         (status = 500, description = "Internal server error", body = String)
     )
 )]
-async fn delete_session(
+pub async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<String, (StatusCode, String)> {
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/delete_session/{}",
+        "{}/WorkerPoolService/pool/delete_session/{}",
         state.restate_base_url, id
     );
 
