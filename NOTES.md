@@ -94,5 +94,5 @@ It intentionally sacrifices:
 - Stateless request handling
 - HTTP-layer ergonomics
 
-Given the one-week time constraint, the focus was on **Restate’s execution and persistence model** with orchestrating parallel reliable sessions, rather than building a fully production-ready control plane. The project will continue to evolve, particularly around Kubernetes integration.
+Given the time constraints, the focus was on **Restate’s execution and persistence model** with orchestrating parallel reliable sessions, rather than building a fully production-ready control plane. The project will continue to evolve, particularly around Kubernetes integration.
 
