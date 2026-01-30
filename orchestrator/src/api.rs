@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use std::net::TcpListener;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
@@ -27,6 +28,7 @@ pub fn router(restate_base_url: String) -> Router {
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(health))
         .routes(routes!(status))
+        .routes(routes!(get_all_sessions))
         .routes(routes!(get_session, post_session, delete_session))
         .with_state(state)
         .split_for_parts();
@@ -38,7 +40,7 @@ pub struct Session {
     available: bool,
     worker_id: String,
     user: String,
-    // data: Data,
+    //   last_active: i64, // data: Data,
     // created_at: i64,
 }
 #[derive(Default, Clone, Deserialize, Serialize)]
@@ -58,6 +60,16 @@ struct CreateSessionResponse {
     created_at: i64,
     data: Data,
 }
+// #[derive(Deserialize)]
+// struct CreateWorkerResponse {
+//     id: String,
+//     available: bool,
+//     worker_id: String,
+//     user: String,
+//     last_active: i64,
+//     created_at: i64,
+//     data: Data,
+// }
 #[derive(Default, Clone, Deserialize, Serialize, JsonSchema, ToSchema)]
 pub struct Data {
     pub user: String,
@@ -65,16 +77,115 @@ pub struct Data {
 // Restate service definition
 #[restate_sdk::object]
 pub trait WorkerPoolService {
+    async fn poll_stale_sessions() -> Result<(), HandlerError>;
+    async fn poll_stale_workers() -> Result<(), HandlerError>;
     async fn spawn_worker(user: String) -> Result<String, HandlerError>;
     async fn health_check(session_id: String) -> Result<String, HandlerError>;
     async fn status_check(session_id: String) -> Result<String, HandlerError>;
     // async fn health_poll(session_id: String) -> Result<(), HandlerError>;
     //async fn spawn_session(session_id: String) -> Result<(), HandlerError>;
     async fn get_session(session_id: String) -> Result<String, HandlerError>;
+    async fn get_all_sessions() -> Result<String, HandlerError>;
     async fn delete_session(session_id: String) -> Result<String, HandlerError>;
 }
 // Restate service implementation
 impl WorkerPoolService for Pool {
+    // Helps with inducing TTL based session timeouts
+    async fn poll_stale_sessions(&self, ctx: ObjectContext<'_>) -> Result<(), HandlerError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => return Ok(()), // nothing to do
+        };
+
+        let mut remaining_sessions = Vec::new();
+
+        for session in pool.session_list.into_iter() {
+            let age = now - 234;
+
+            if age < 60 {
+                remaining_sessions.push(session);
+                continue;
+            }
+
+            // stale session → delete remotely
+            let worker = pool
+                .worker_list
+                .iter_mut()
+                .find(|w| w.id == session.worker_id);
+
+            if let Some(worker) = worker {
+                if let Some(port) = worker.port {
+                    let session_id = session.id.clone();
+
+                    ctx.run(move || async move {
+                        let client = Client::new();
+                        let _ = client
+                            .delete(format!("http://localhost:{}/sessions/{}", port, session_id))
+                            .send()
+                            .await;
+                        Ok(())
+                    })
+                    .await?;
+                }
+
+                worker.available = true;
+            }
+        }
+
+        pool.session_list = remaining_sessions;
+
+        ctx.set("pool_state", serde_json::to_vec(&pool)?);
+
+        Ok(())
+    }
+    async fn poll_stale_workers(&self, ctx: ObjectContext<'_>) -> Result<(), HandlerError> {
+        let mut pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => return Ok(()),
+        };
+
+        let mut healthy_workers = Vec::new();
+
+        for mut worker in pool.worker_list.into_iter() {
+            let client = Client::new();
+            let health_status: String = ctx
+                .run(move || async move {
+                    let response = client
+                        .get(format!(
+                            "http://localhost:{}/health",
+                            worker.port.unwrap_or_default().to_string()
+                        ))
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            TerminalError::new(format!("Failed to send health request: {}", e))
+                        })?;
+
+                    let body = response.text().await.map_err(|e| {
+                        TerminalError::new(format!("Failed to read health response body: {}", e))
+                    })?;
+
+                    Ok(body)
+                })
+                .await?;
+            if health_status == "ok".to_string() {
+                worker.available = true;
+                healthy_workers.push(worker);
+            }
+        }
+
+        pool.worker_list = healthy_workers;
+
+        ctx.set("pool_state", serde_json::to_vec(&pool)?);
+
+        Ok(())
+    }
+
     async fn health_check(
         &self,
         ctx: ObjectContext<'_>,
@@ -235,17 +346,18 @@ impl WorkerPoolService for Pool {
             .map_err(|e| TerminalError::new(format!("Invalid JSON response: {}", e)))?;
 
         let session = Session {
-            id: parsed.id,
+            id: parsed.id.clone(),
             available: true,
-            worker_id: worker_id,
-            user: parsed.data.user,
+            worker_id: worker_id.clone(),
+            user: parsed.data.user.clone(),
+            // last_active: parsed.created_at.clone(),
         };
         // Update Session
         pool.session_list.insert(0, session.clone());
         let bytes = serde_json::to_vec(&pool)?;
         // Persist state
         ctx.set("pool_state", bytes);
-        Ok(spawn_session + "\nworker_port:" + &worker_port.to_string())
+        Ok(spawn_session)
     }
     async fn get_session(
         &self,
@@ -301,6 +413,43 @@ impl WorkerPoolService for Pool {
 
         Ok(health_status)
     }
+    async fn get_all_sessions(&self, ctx: ObjectContext<'_>) -> Result<String, HandlerError> {
+        let pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => Pool::default(),
+        };
+
+        let mut results: Vec<String> = Vec::new();
+
+        for worker in &pool.worker_list {
+            let Some(port) = worker.port else {
+                continue;
+            };
+
+            let client = Client::new();
+            let body: String = ctx
+                .run(move || async move {
+                    let response = client
+                        .get(format!("http://localhost:{}/status", port))
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            TerminalError::new(format!("Failed to send health request: {}", e))
+                        })?;
+
+                    let body = response.text().await.map_err(|e| {
+                        TerminalError::new(format!("Failed to read health response body: {}", e))
+                    })?;
+
+                    Ok(body)
+                })
+                .await?;
+            results.push(body);
+        }
+
+        Ok(serde_json::to_string(&results)?)
+    }
+
     // This does not manage the worker state (worker remains undeleted)
     async fn delete_session(
         &self,
@@ -375,11 +524,11 @@ async fn health(
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/pool/health_check/{}",
-        state.restate_base_url, id
+        "{}/WorkerPoolService/pool/health_check",
+        state.restate_base_url
     );
 
-    let response = client.get(url).send().await.map_err(|e| {
+    let response = client.post(url).json(&id).send().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to send health request: {e}"),
@@ -413,11 +562,11 @@ async fn status(
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/pool/status_check/{}",
-        state.restate_base_url, id
+        "{}/WorkerPoolService/pool/status_check",
+        state.restate_base_url
     );
 
-    let response = client.get(url).send().await.map_err(|e| {
+    let response = client.post(url).json(&id).send().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to send status request: {e}"),
@@ -449,8 +598,40 @@ pub async fn get_session(
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/pool/get_session/{}",
-        state.restate_base_url, id
+        "{}/WorkerPoolService/pool/get_session",
+        state.restate_base_url
+    );
+
+    let response = client.post(url).json(&id).send().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to send get_session request: {e}"),
+        )
+    })?;
+
+    response.text().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read get_session response: {e}"),
+        )
+    })
+}
+#[utoipa::path(
+    get,
+    path = "/get_all_sessions",
+    responses(
+        (status = 200, description = "session details", body = String),
+        (status = 500, description = "Internal server error", body = String)
+    )
+)]
+pub async fn get_all_sessions(
+    State(state): State<AppState>,
+) -> Result<String, (StatusCode, String)> {
+    let client = Client::new();
+
+    let url = format!(
+        "{}/WorkerPoolService/pool/get_all_sessions",
+        state.restate_base_url
     );
 
     let response = client.get(url).send().await.map_err(|e| {
@@ -467,7 +648,6 @@ pub async fn get_session(
         )
     })
 }
-
 #[utoipa::path(
     post,
     path = "/session",
@@ -525,11 +705,11 @@ pub async fn delete_session(
     let client = Client::new();
 
     let url = format!(
-        "{}/WorkerPoolService/pool/delete_session/{}",
-        state.restate_base_url, id
+        "{}/WorkerPoolService/pool/delete_session",
+        state.restate_base_url
     );
 
-    let response = client.delete(url).send().await.map_err(|e| {
+    let response = client.delete(url).json(&id).send().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to delete session: {e}"),

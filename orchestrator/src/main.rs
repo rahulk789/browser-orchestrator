@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     });
 
-    let restate_ingress = "http://127.0.0.1:9070".to_string();
+    let restate_ingress = "http://127.0.0.1:8080".to_string();
     let listener = TcpListener::bind("127.0.0.1:3000").await?;
     let axum_handle = tokio::spawn(async move {
         axum::serve(listener, api::router(restate_ingress))
