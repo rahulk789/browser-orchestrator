@@ -90,10 +90,10 @@ pub trait WorkerPoolService {
     async fn status_check(
         session_id: String,
     ) -> Result<RestateJson<SessionStatusResponse>, HandlerError>;
-    // async fn health_poll(session_id: String) -> Result<(), HandlerError>;
-    //async fn spawn_session(session_id: String) -> Result<(), HandlerError>;
-    async fn get_session(session_id: String) -> Result<String, HandlerError>;
-    async fn get_all_sessions() -> Result<String, HandlerError>;
+    async fn get_session(
+        session_id: String,
+    ) -> Result<RestateJson<CreateSessionResponse>, HandlerError>;
+    async fn get_all_sessions() -> Result<RestateJson<Vec<CreateSessionResponse>>, HandlerError>;
     async fn delete_session(session_id: String) -> Result<String, HandlerError>;
 }
 // Restate service implementation
@@ -190,7 +190,6 @@ impl WorkerPoolService for Pool {
         pool.worker_list = healthy_workers;
 
         ctx.set("pool_state", serde_json::to_vec(&pool)?);
-
         Ok(())
     }
 
@@ -374,7 +373,7 @@ impl WorkerPoolService for Pool {
         &self,
         ctx: ObjectContext<'_>,
         session_id: String,
-    ) -> Result<String, HandlerError> {
+    ) -> Result<RestateJson<CreateSessionResponse>, HandlerError> {
         let pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => Pool::default(),
@@ -401,7 +400,7 @@ impl WorkerPoolService for Pool {
             .ok_or(TerminalError::new(format!("Error fetching worker port")))?;
 
         let client = Client::new();
-        let health_status: String = ctx
+        let session_body: String = ctx
             .run(move || async move {
                 let response = client
                     .get(format!(
@@ -411,7 +410,7 @@ impl WorkerPoolService for Pool {
                     .send()
                     .await
                     .map_err(|e| {
-                        TerminalError::new(format!("Failed to send health request: {}", e))
+                        TerminalError::new(format!("Failed to send get_session request: {}", e))
                     })?;
 
                 let body = response.text().await.map_err(|e| {
@@ -421,16 +420,21 @@ impl WorkerPoolService for Pool {
                 Ok(body)
             })
             .await?;
+        let parsed: CreateSessionResponse = serde_json::from_str(&session_body.clone())
+            .map_err(|e| TerminalError::new(format!("Invalid JSON response: {}", e)))?;
 
-        Ok(health_status)
+        Ok(RestateJson(parsed))
     }
-    async fn get_all_sessions(&self, ctx: ObjectContext<'_>) -> Result<String, HandlerError> {
+    async fn get_all_sessions(
+        &self,
+        ctx: ObjectContext<'_>,
+    ) -> Result<RestateJson<Vec<CreateSessionResponse>>, HandlerError> {
         let pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => Pool::default(),
         };
 
-        let mut results: Vec<String> = Vec::new();
+        let mut results: Vec<CreateSessionResponse> = Vec::new();
 
         for worker in &pool.worker_list {
             let Some(port) = worker.port else {
@@ -445,29 +449,36 @@ impl WorkerPoolService for Pool {
                         .send()
                         .await
                         .map_err(|e| {
-                            TerminalError::new(format!("Failed to send health request: {}", e))
+                            TerminalError::new(format!(
+                                "Failed to send get_all_sessions request: {}",
+                                e
+                            ))
                         })?;
 
                     let body = response.text().await.map_err(|e| {
-                        TerminalError::new(format!("Failed to read health response body: {}", e))
+                        TerminalError::new(format!(
+                            "Failed to get_all_sessions health response body: {}",
+                            e
+                        ))
                     })?;
 
                     Ok(body)
                 })
                 .await?;
-            results.push(body);
-        }
+            let parsed: CreateSessionResponse = serde_json::from_str(&body)
+                .map_err(|e| TerminalError::new(format!("Invalid session JSON: {}", e)))?;
 
-        Ok(serde_json::to_string(&results)?)
+            results.push(parsed);
+        }
+        Ok(RestateJson(results))
     }
 
-    // This does not manage the worker state (worker remains undeleted)
     async fn delete_session(
         &self,
         ctx: ObjectContext<'_>,
         session_id: String,
     ) -> Result<String, HandlerError> {
-        let pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
+        let mut pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => Pool::default(),
         };
@@ -480,20 +491,20 @@ impl WorkerPoolService for Pool {
                 "Error fetching session from session_list"
             )))?;
 
-        let worker = pool
+        let idx = pool
             .worker_list
             .iter()
-            .find(|w| w.id == session.worker_id)
-            .ok_or(TerminalError::new(format!(
-                "Error fetching session_worker from worker_list"
-            )))?;
-
+            .position(|w| w.id == session.worker_id)
+            .ok_or(TerminalError::new(
+                "Error fetching session_worker from worker_list",
+            ))?;
+        let worker = pool.worker_list.remove(idx);
         let worker_port = worker
             .port
             .ok_or(TerminalError::new(format!("Error fetching worker port")))?;
 
         let client = Client::new();
-        let health_status: String = ctx
+        let delete_session: String = ctx
             .run(move || async move {
                 let response = client
                     .delete(format!(
@@ -503,18 +514,21 @@ impl WorkerPoolService for Pool {
                     .send()
                     .await
                     .map_err(|e| {
-                        TerminalError::new(format!("Failed to send health request: {}", e))
+                        TerminalError::new(format!("Failed to send delete request: {}", e))
                     })?;
 
                 let body = response.text().await.map_err(|e| {
-                    TerminalError::new(format!("Failed to read health response body: {}", e))
+                    TerminalError::new(format!("Failed to read delete response body: {}", e))
                 })?;
 
                 Ok(body)
             })
             .await?;
 
-        Ok(health_status)
+        let bytes = serde_json::to_vec(&pool)?;
+        // Persist state
+        ctx.set("pool_state", bytes);
+        Ok(delete_session)
     }
 }
 #[utoipa::path(
@@ -728,7 +742,7 @@ pub async fn delete_session(
         state.restate_base_url
     );
 
-    let response = client.delete(url).json(&id).send().await.map_err(|e| {
+    let response = client.post(url).json(&id).send().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to delete session: {e}"),
