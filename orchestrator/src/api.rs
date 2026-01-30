@@ -40,8 +40,6 @@ pub struct Session {
     available: bool,
     worker_id: String,
     user: String,
-    //   last_active: i64, // data: Data,
-    // created_at: i64,
 }
 #[derive(Default, Clone, Deserialize, Serialize)]
 pub struct Worker {
@@ -65,16 +63,6 @@ pub struct SessionStatusResponse {
     session_id: String,
     available: bool,
 }
-// #[derive(Deserialize)]
-// struct CreateWorkerResponse {
-//     id: String,
-//     available: bool,
-//     worker_id: String,
-//     user: String,
-//     last_active: i64,
-//     created_at: i64,
-//     data: Data,
-// }
 #[derive(Default, Clone, Deserialize, Serialize, JsonSchema, ToSchema)]
 pub struct Data {
     pub user: String,
@@ -412,7 +400,6 @@ impl WorkerPoolService for Pool {
                     .map_err(|e| {
                         TerminalError::new(format!("Failed to send get_session request: {}", e))
                     })?;
-
                 let body = response.text().await.map_err(|e| {
                     TerminalError::new(format!("Failed to read health response body: {}", e))
                 })?;
@@ -613,7 +600,8 @@ async fn status(
     ),
     responses(
         (status = 200, description = "session details", body = String),
-        (status = 500, description = "Internal server error", body = String)
+        (status = 500, description = "Internal server error", body = String),
+        (status = 404, description = "Not Found", body = String)
     )
 )]
 pub async fn get_session(
@@ -646,7 +634,8 @@ pub async fn get_session(
     path = "/get_all_sessions",
     responses(
         (status = 200, description = "session details", body = String),
-        (status = 500, description = "Internal server error", body = String)
+        (status = 500, description = "Internal server error", body = String),
+        (status = 404, description = "Not Found", body = String)
     )
 )]
 pub async fn get_all_sessions(
