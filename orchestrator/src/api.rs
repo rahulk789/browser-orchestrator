@@ -1,8 +1,8 @@
-use axum::Json;
-use axum::{Router, response::IntoResponse};
+use axum::{Json, Router, response::IntoResponse};
 use axum::{extract::Path, extract::State, http::StatusCode};
 use reqwest::Client;
 use restate_sdk::prelude::*;
+use restate_sdk::serde::Json as RestateJson;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -54,11 +54,16 @@ pub struct Pool {
     session_list: Vec<Session>,
     worker_list: Vec<Worker>,
 }
-#[derive(Deserialize)]
-struct CreateSessionResponse {
+#[derive(Default, Clone, Deserialize, Serialize, JsonSchema, ToSchema)]
+pub struct CreateSessionResponse {
     id: String,
     created_at: i64,
     data: Data,
+}
+#[derive(Default, Clone, Deserialize, Serialize, JsonSchema, ToSchema)]
+pub struct SessionStatusResponse {
+    session_id: String,
+    available: bool,
 }
 // #[derive(Deserialize)]
 // struct CreateWorkerResponse {
@@ -79,9 +84,12 @@ pub struct Data {
 pub trait WorkerPoolService {
     async fn poll_stale_sessions() -> Result<(), HandlerError>;
     async fn poll_stale_workers() -> Result<(), HandlerError>;
-    async fn spawn_worker(user: String) -> Result<String, HandlerError>;
+    async fn spawn_worker(user: String)
+    -> Result<RestateJson<CreateSessionResponse>, HandlerError>;
     async fn health_check(session_id: String) -> Result<String, HandlerError>;
-    async fn status_check(session_id: String) -> Result<String, HandlerError>;
+    async fn status_check(
+        session_id: String,
+    ) -> Result<RestateJson<SessionStatusResponse>, HandlerError>;
     // async fn health_poll(session_id: String) -> Result<(), HandlerError>;
     //async fn spawn_session(session_id: String) -> Result<(), HandlerError>;
     async fn get_session(session_id: String) -> Result<String, HandlerError>;
@@ -241,7 +249,7 @@ impl WorkerPoolService for Pool {
         &self,
         ctx: ObjectContext<'_>,
         session_id: String,
-    ) -> Result<String, HandlerError> {
+    ) -> Result<RestateJson<SessionStatusResponse>, HandlerError> {
         let pool: Pool = match ctx.get::<Vec<u8>>("pool_state").await? {
             Some(bytes) => serde_json::from_slice(&bytes)?,
             None => Pool::default(),
@@ -268,7 +276,7 @@ impl WorkerPoolService for Pool {
             .ok_or(TerminalError::new(format!("Error fetching worker port")))?;
 
         let client = Client::new();
-        let health_status: String = ctx
+        let status_response: String = ctx
             .run(move || async move {
                 let response = client
                     .get(format!("http://localhost:{}/status", worker_port))
@@ -285,14 +293,16 @@ impl WorkerPoolService for Pool {
                 Ok(body)
             })
             .await?;
+        let parsed: SessionStatusResponse = serde_json::from_str(&status_response.clone())
+            .map_err(|e| TerminalError::new(format!("Invalid JSON response: {}", e)))?;
 
-        Ok(health_status)
+        Ok(RestateJson(parsed))
     }
     async fn spawn_worker(
         &self,
         mut ctx: ObjectContext<'_>,
         user: String,
-    ) -> Result<String, HandlerError> {
+    ) -> Result<RestateJson<CreateSessionResponse>, HandlerError> {
         let ready_port = get_port();
         ctx.run(|| async {
             Command::new("steel-browser")
@@ -357,8 +367,9 @@ impl WorkerPoolService for Pool {
         let bytes = serde_json::to_vec(&pool)?;
         // Persist state
         ctx.set("pool_state", bytes);
-        Ok(spawn_session)
+        Ok(RestateJson(parsed))
     }
+
     async fn get_session(
         &self,
         ctx: ObjectContext<'_>,
@@ -659,7 +670,7 @@ pub async fn get_all_sessions(
 pub async fn post_session(
     State(state): State<AppState>,
     Json(payload): Json<Data>,
-) -> impl IntoResponse {
+) -> Result<Json<CreateSessionResponse>, (StatusCode, String)> {
     let client = Client::new();
 
     let url = format!(
@@ -678,13 +689,21 @@ pub async fn post_session(
                 format!("Failed to spawn session: {e}"),
             )
         })?;
-
-    response.text().await.map_err(|e| {
+    let raw = response.text().await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to read spawn response: {e}"),
         )
-    })
+    })?;
+
+    let session: CreateSessionResponse = serde_json::from_str(&raw).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Invalid session JSON: {e}"),
+        )
+    })?;
+
+    Ok(Json(session))
 }
 
 #[utoipa::path(
